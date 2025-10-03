@@ -1,0 +1,50 @@
+[
+    {
+      "hostname": "6.32.171-OLT2-DM4615-CDT",
+      "ip": "100.76.32.171"
+    },
+    {
+      "hostname": "6-29-54-OLT-VMANDI-DM4610",
+      "ip": "100.76.29.54"
+    },
+    {
+      "hostname": "6.85.38-OLT-BARREIRA-DO-CAMPO",
+      "ip": "100.76.85.38"
+    },
+    {
+      "hostname": "5.55.18-OLT-CASEARA",
+      "ip": "100.75.55.18"
+    },
+    {
+      "hostname": "6.44.229-OLT4-VILA-RICA",
+      "ip": "100.76.44.229"
+    },
+    {
+      "hostname": "6.44.228-OLT3-VILA-RICA",
+      "ip": "100.76.44.228"
+    },
+    {
+      "hostname": "5.20.78-OLT2-LGC-DM4615",
+      "ip": "100.75.20.78"
+    },
+    {
+      "hostname": "5.20.74-OLT1-LGC-DM4615",
+      "ip": "100.75.20.74"
+    },
+    {
+      "hostname": "6.31.4-OLT4-STDA",
+      "ip": "100.76.31.4"
+    },
+    {
+      "hostname": "6.125.26-OLT-DM4615-CANABRAVA",
+      "ip": "100.76.125.26"
+    },
+    {
+      "hostname": "6.31.29-OLT-DM4610-CALPARA-STA-FE",
+      "ip": "100.76.31.29"
+    },
+    {
+      "hostname": "6.154.254-OLT2-PAN-DM4615",
+      "ip": "100.76.154.254"
+    }
+  ]
