@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -20,10 +22,8 @@ import (
 
 // Constantes
 const (
-	DOWNLOAD_COMMAND      = "request firmware onu add tftp://100.76.180.36/DATACOM/US_HG7_HG9_v2.0.13_300002167_en_xpon.tar"
+	DOWNLOAD_COMMAND      = "request firmware onu add tftp://100.76.180.36/DATACOM/1216-17-DM986-100-SFU.tar"
 	SHOW_FIRMWARE_COMMAND = "show firmware onu"
-	SOURCE_INVENTORY_FILE = "inventario_olts.json"
-	TARGET_FILE           = "alvos.json"
 )
 
 // Estruturas de Dados
@@ -40,34 +40,178 @@ type FirmwareInfo struct {
 	Name, MD5, Size string
 }
 
+// --- ESTRUTURAS PARA A API ZABBIX ---
+
+// ZabbixRequest é a estrutura genérica para todos os pedidos JSON-RPC
+type ZabbixRequest struct {
+	Jsonrpc string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+	Auth    string      `json:"auth,omitempty"` // omitempty faz com que o campo seja omitido se estiver vazio
+	ID      int         `json:"id"`
+}
+
+// ZabbixResponse é a estrutura genérica para as respostas
+type ZabbixResponse struct {
+	Jsonrpc string      `json:"jsonrpc"`
+	Result  interface{} `json:"result"`
+	Error   struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    string `json:"data"`
+	} `json:"error"`
+}
+
+// HostInterface define a estrutura da interface de um host
+type HostInterface struct {
+	IP string `json:"ip"`
+}
+
+// Host define a estrutura de um host retornado pela API
 type Host struct {
-	Hostname   string      `json:"host"`
-	Interfaces []Interface `json:"interfaces"`
-}
-type Interface struct {
-	Type string `json:"type"`
-	IP   string `json:"ip"`
+	HostID     string          `json:"hostid"`
+	Hostname   string          `json:"host"`
+	Interfaces []HostInterface `json:"interfaces"`
 }
 
-// Estruturas para o JSON do Zabbix (sem alterações)
-type ZabbixExport struct {
-	ZabbixExport struct {
-		Hosts []Host `json:"hosts"`
-	} `json:"zabbix_export"`
-}
+// --- CLIENTE DA API ZABBIX ---
 
-func extractOLTs(data []byte) ([]OLT, error) {
-	var zabbixData ZabbixExport
-	if err := json.Unmarshal(data, &zabbixData); err != nil {
-		return nil, fmt.Errorf("erro ao decodificar JSON do Zabbix: %w", err)
+const (
+	ZABBIX_API_URL = "http://100.76.180.210/api_jsonrpc.php"
+	ZABBIX_USER    = "arcpath_api"
+	ZABBIX_PASS    = "k4p9nort3"
+	TEMPLATE_NAME  = "Provedor - Datacom OLT"
+)
+
+// zabbixRequest é nossa função "garçom" genérica.
+func zabbixRequest(payload ZabbixRequest) (interface{}, error) {
+	// Serializa o nosso struct Go para JSON (equivalente ao json.dumps() do Python)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao serializar payload: %w", err)
 	}
+
+	// Cria a requisição HTTP POST (equivalente ao requests.post() do Python)
+	req, err := http.NewRequest("POST", ZABBIX_API_URL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar requisição: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json-rpc")
+
+	// Envia a requisição
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao enviar requisição para a API Zabbix: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Lê o corpo da resposta
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao ler resposta da API: %w", err)
+	}
+
+	// Desserializa a resposta JSON para nosso struct (equivalente ao r.json() do Python)
+	var zabbixResp ZabbixResponse
+	if err := json.Unmarshal(body, &zabbixResp); err != nil {
+		return nil, fmt.Errorf("erro ao desserializar resposta da API: %w", err)
+	}
+
+	// Verifica por erros lógicos da API Zabbix
+	if zabbixResp.Error.Code != 0 {
+		return nil, fmt.Errorf("erro da API Zabbix: %s - %s", zabbixResp.Error.Message, zabbixResp.Error.Data)
+	}
+
+	return zabbixResp.Result, nil
+}
+
+// ZabbixLogin autentica e retorna um token
+func ZabbixLogin() (string, error) {
+	payload := ZabbixRequest{
+		Jsonrpc: "2.0",
+		Method:  "user.login",
+		Params:  map[string]string{"username": ZABBIX_USER, "password": ZABBIX_PASS},
+		ID:      1,
+	}
+
+	result, err := zabbixRequest(payload)
+	if err != nil {
+		return "", err
+	}
+	// O resultado é uma string, então fazemos um "type assertion"
+	authToken, ok := result.(string)
+	if !ok {
+		return "", fmt.Errorf("token de autenticação inválido")
+	}
+	return authToken, nil
+}
+
+// GetTemplateID busca o ID de um template pelo nome, tentando tanto pelo 'host' quanto pelo 'name'.
+func GetTemplateID(auth string) (string, error) {
+	// --- PRIMEIRA TENTATIVA: Buscar pelo campo 'host' (nome técnico) ---
+	payload := ZabbixRequest{
+		Jsonrpc: "2.0",
+		Method:  "template.get",
+		Params:  map[string]interface{}{"output": "templateid", "filter": map[string][]string{"host": {TEMPLATE_NAME}}},
+		Auth:    auth,
+		ID:      1,
+	}
+	result, err := zabbixRequest(payload)
+	if err != nil {
+		return "", err
+	}
+
+	templates := result.([]interface{})
+
+	// --- SE A PRIMEIRA TENTATIVA FALHAR, TENTA PELO CAMPO 'name' (nome visível) ---
+	if len(templates) == 0 {
+		fmt.Println("Template não encontrado pelo 'host', tentando pelo 'name'...")
+		payload.Params = map[string]interface{}{"output": "templateid", "filter": map[string][]string{"name": {TEMPLATE_NAME}}}
+		result, err = zabbixRequest(payload)
+		if err != nil {
+			return "", err
+		}
+		templates = result.([]interface{})
+	}
+
+	// Se ainda assim não encontrar, retorna o erro
+	if len(templates) == 0 {
+		return "", fmt.Errorf("template '%s' não encontrado nem por 'host' nem por 'name'", TEMPLATE_NAME)
+	}
+
+	// Extrai o ID do primeiro resultado encontrado
+	templateID := templates[0].(map[string]interface{})["templateid"].(string)
+	return templateID, nil
+}
+
+// GetHostsByTemplate busca todas as OLTs e as converte para nosso formato interno
+func GetHostsByTemplate(auth, templateID string) ([]OLT, error) {
+	payload := ZabbixRequest{
+		Jsonrpc: "2.0",
+		Method:  "host.get",
+		Params:  map[string]interface{}{"output": []string{"hostid", "host"}, "templateids": templateID, "selectInterfaces": "extend"},
+		Auth:    auth,
+		ID:      1,
+	}
+	result, err := zabbixRequest(payload)
+	if err != nil {
+		return nil, err
+	}
+	//fmt.Println("Hosts encontrados:", result)
+
+	// Precisamos converter o resultado genérico para nossa struct Host
+	resultBytes, _ := json.Marshal(result)
+	var hosts []Host
+	if err := json.Unmarshal(resultBytes, &hosts); err != nil {
+		return nil, fmt.Errorf("erro ao converter hosts: %w", err)
+	}
+
+	// Converte a lista de Hosts da API para a lista de OLTs que o resto do nosso script usa
 	var olts []OLT
-	for _, host := range zabbixData.ZabbixExport.Hosts {
-		for _, iface := range host.Interfaces {
-			if iface.Type == "SNMP" {
-				olts = append(olts, OLT{Hostname: host.Hostname, IP: iface.IP})
-				break
-			}
+	for _, host := range hosts {
+		if len(host.Interfaces) > 0 {
+			olts = append(olts, OLT{Hostname: host.Hostname, IP: host.Interfaces[0].IP})
 		}
 	}
 	return olts, nil
@@ -172,40 +316,34 @@ func formatResult(result OLTResult) string {
 }
 
 func main() {
-	// --- Lógica de Carregamento do `alvos.json` (sem alterações) ---
-	var olts []OLT
-	_, err := os.Stat(TARGET_FILE)
-	if os.IsNotExist(err) {
-		fmt.Printf("Arquivo '%s' não encontrado. Gerando a partir de '%s'...\n", TARGET_FILE, SOURCE_INVENTORY_FILE)
-		sourceData, err := ioutil.ReadFile(SOURCE_INVENTORY_FILE)
-		if err != nil {
-			log.Fatalf("Falha ao ler o arquivo de inventário fonte '%s': %v", SOURCE_INVENTORY_FILE, err)
-		}
-		olts, err = extractOLTs(sourceData)
-		if err != nil {
-			log.Fatalf("Falha ao extrair dados do inventário: %v", err)
-		}
-		targetData, err := json.MarshalIndent(olts, "", "  ")
-		if err != nil {
-			log.Fatalf("Falha ao formatar JSON para o arquivo de alvos: %v", err)
-		}
-		err = ioutil.WriteFile(TARGET_FILE, targetData, 0644)
-		if err != nil {
-			log.Fatalf("Falha ao escrever o arquivo de alvos '%s': %v", TARGET_FILE, err)
-		}
-		fmt.Printf("Arquivo '%s' criado. O script continuará com %d alvos.\n", TARGET_FILE, len(olts))
-	} else {
-		fmt.Printf("Usando lista de alvos do arquivo existente '%s'.\n", TARGET_FILE)
-		targetData, err := ioutil.ReadFile(TARGET_FILE)
-		if err != nil {
-			log.Fatalf("Falha ao ler o arquivo de alvos '%s': %v", TARGET_FILE, err)
-		}
-		if err := json.Unmarshal(targetData, &olts); err != nil {
-			log.Fatalf("Falha ao decodificar o JSON do arquivo de alvos: %v", err)
-		}
+	fmt.Println("--- FASE 0: Buscando lista de OLTs na API do Zabbix ---")
+
+	// 1. Autenticar na API
+	fmt.Println("Autenticando na API Zabbix...")
+	authToken, err := ZabbixLogin()
+	if err != nil {
+		log.Fatalf("ERRO FATAL: Falha no login da API Zabbix: %v", err)
 	}
+	fmt.Println("Login bem-sucedido.")
+
+	// 2. Obter o ID do Template
+	fmt.Println("Buscando ID do template...")
+	templateID, err := GetTemplateID(authToken)
+	if err != nil {
+		log.Fatalf("ERRO FATAL: Falha ao buscar template ID: %v", err)
+	}
+	fmt.Printf("Template ID encontrado: %s\n", templateID)
+
+	// 3. Obter a lista de hosts (OLTs)
+	fmt.Println("Buscando hosts do template...")
+	olts, err := GetHostsByTemplate(authToken, templateID)
+	if err != nil {
+		log.Fatalf("ERRO FATAL: Falha ao buscar hosts: %v", err)
+	}
+	fmt.Printf("%d OLTs encontradas na API.\n", len(olts))
+
 	if len(olts) == 0 {
-		log.Println("Nenhum alvo para processar.")
+		log.Println("Nenhum alvo encontrado na API. Encerrando.")
 		return
 	}
 
